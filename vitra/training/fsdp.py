@@ -7,6 +7,7 @@ fine-grained control over wrapping policies and mixed precision per component).
 import gc
 import json
 import math
+import re
 import threading
 from datetime import datetime
 from functools import partial
@@ -65,6 +66,19 @@ def move_to_device(value, device):
     return value
 
 
+def _assert_finite_tensor(name: str, value: torch.Tensor, *, global_step: int, batch_idx: int) -> None:
+    if not torch.is_floating_point(value):
+        return
+    if torch.isfinite(value).all():
+        return
+
+    nonfinite = torch.logical_not(torch.isfinite(value))
+    raise RuntimeError(
+        f"Non-finite values in `{name}` at global_step={global_step}, batch_idx={batch_idx}; "
+        f"shape={tuple(value.shape)}, nonfinite_count={int(nonfinite.sum().item())}"
+    )
+
+
 def get_constant_schedule_with_freeze_warmup(
     optimizer: torch.optim.Optimizer,
     num_warmup_steps: int,
@@ -97,6 +111,18 @@ def split_modality_collator(
         """Check if the parameter is part of the vision or text backbone."""
         if move_word_embedding_to_action_model and "embed_tokens" in name:
             return False
+        if any(
+            marker in name
+            for marker in (
+                "vision_encoder",
+                "text_encoder",
+                "fusion",
+                "cognition_projection",
+                "student_state_encoder",
+                "vitkd_",
+            )
+        ):
+            return True
         return "backbone" in name
 
     for name, param in vla.named_parameters():
@@ -259,8 +285,6 @@ class VLAFSDPStrategy(TrainingStrategy):
 
     def load_optimizer_and_scheduler(self, checkpoint_folder: str) -> None:
         """Load optimizer and scheduler state from checkpoint."""
-        assert isinstance(self.vla, FSDP), "FSDPStrategy.load_optimizer_and_scheduler assumes VLM is already wrapped in FSDP!"
-        
         checkpoint_folder = Path(checkpoint_folder)
         optimizer_path = checkpoint_folder / "optimizer.pt"
         
@@ -268,8 +292,18 @@ class VLAFSDPStrategy(TrainingStrategy):
             overwatch.warning(f"Optimizer checkpoint not found at {optimizer_path}!")
             return
         
-        # Load checkpoint (FSDP handles device placement automatically)
         optim_state_dict = torch.load(optimizer_path, map_location="cpu")
+
+        if not self.use_fsdp:
+            self.optimizer.load_state_dict(optim_state_dict)
+            match = re.search(r"step=(\d+)", checkpoint_folder.name)
+            if match and self.lr_scheduler is not None:
+                for _ in range(int(match.group(1))):
+                    self.lr_scheduler.step()
+            overwatch.info(f"Loaded optimizer state dict from {optimizer_path}")
+            return
+
+        assert isinstance(self.vla, FSDP), "FSDPStrategy.load_optimizer_and_scheduler assumes VLM is already wrapped in FSDP!"
         
         with FSDP.state_dict_type(
             self.vla,
@@ -500,6 +534,9 @@ class VLAFSDPStrategy(TrainingStrategy):
                     current_state_mask = batch["current_state_mask"]
                     current_state = batch["current_state"]
                     fov = batch["fov"]
+                    _assert_finite_tensor("actions", action_labels, global_step=metrics.global_step, batch_idx=batch_idx)
+                    _assert_finite_tensor("current_state", current_state, global_step=metrics.global_step, batch_idx=batch_idx)
+                    _assert_finite_tensor("fov", fov, global_step=metrics.global_step, batch_idx=batch_idx)
 
                     prediction = self.vla.forward(
                         rgb,
@@ -513,6 +550,16 @@ class VLAFSDPStrategy(TrainingStrategy):
                         fov=fov,
                     )
                     loss = prediction["loss"]
+                    if not torch.isfinite(loss).all():
+                        details = {
+                            key: float(value.detach().float().mean().item())
+                            for key, value in prediction.items()
+                            if torch.is_tensor(value) and value.numel() > 0 and torch.is_floating_point(value)
+                        }
+                        raise RuntimeError(
+                            f"Non-finite training loss at global_step={metrics.global_step}, batch_idx={batch_idx}; "
+                            f"metrics={details}"
+                        )
 
                     # Commit loss and backward
                     zero_metric = loss.detach() * 0

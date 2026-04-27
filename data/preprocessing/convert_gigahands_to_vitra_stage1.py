@@ -41,6 +41,7 @@ class SourceEpisode:
     sequence_root: Path
     params_path: Path
     keypoints_path: Path | None
+    keypoints_source: str | None
     video_path: Path
     camera_path: Path
     instruction: str
@@ -132,25 +133,36 @@ def load_json(path: Path) -> Any:
         return json.load(handle)
 
 
-def find_keypoints_path(sequence_root: Path, sequence_id: str) -> Path | None:
+def find_keypoints_path(
+    sequence_root: Path,
+    sequence_id: str,
+    *,
+    require_real_keypoints: bool = False,
+    allow_mano_keypoint_fallback: bool = True,
+) -> tuple[Path | None, str | None]:
     aliases = [sequence_id]
     if str(sequence_id).isdigit():
         aliases.extend([str(int(sequence_id)), str(sequence_id).zfill(3)])
     aliases = list(dict.fromkeys(aliases))
-    candidates = []
+    candidates: list[tuple[str, Path]] = []
     for alias in aliases:
         candidates.extend(
             [
-                sequence_root / "keypoints_3d_mano" / f"{alias}.json",
-                sequence_root / "keypoints_3d_mano" / alias,
-                sequence_root / "keypoints_3d" / f"{alias}.json",
-                sequence_root / "keypoints_3d" / alias,
+                ("real", sequence_root / "keypoints_3d" / f"{alias}.json"),
+                ("real", sequence_root / "keypoints_3d" / alias),
             ]
         )
-    for candidate in candidates:
+        if allow_mano_keypoint_fallback and not require_real_keypoints:
+            candidates.extend(
+                [
+                    ("mano", sequence_root / "keypoints_3d_mano" / f"{alias}.json"),
+                    ("mano", sequence_root / "keypoints_3d_mano" / alias),
+                ]
+            )
+    for source, candidate in candidates:
         if candidate.exists():
-            return candidate
-    return None
+            return candidate, source
+    return None, None
 
 
 def find_video_path(sequence_root: Path, camera: str) -> Path | None:
@@ -232,11 +244,13 @@ def discover_demo_episodes(root: Path, camera: str) -> list[SourceEpisode]:
             continue
         for params_path in sorted(params_root.glob("*.json")):
             sequence_id = params_path.stem
+            keypoints_path, keypoints_source = find_keypoints_path(sequence_root, sequence_id)
             episodes.append(
                 SourceEpisode(
                     sequence_root=sequence_root,
                     params_path=params_path,
-                    keypoints_path=find_keypoints_path(sequence_root, sequence_id),
+                    keypoints_path=keypoints_path,
+                    keypoints_source=keypoints_source,
                     video_path=video_path,
                     camera_path=camera_path,
                     instruction=find_instruction(video_path, sequence_root.name),
@@ -247,7 +261,13 @@ def discover_demo_episodes(root: Path, camera: str) -> list[SourceEpisode]:
     return episodes
 
 
-def discover_full_episodes(root: Path, camera: str) -> list[SourceEpisode]:
+def discover_full_episodes(
+    root: Path,
+    camera: str,
+    *,
+    require_real_keypoints: bool = False,
+    allow_mano_keypoint_fallback: bool = True,
+) -> list[SourceEpisode]:
     annotations_path = root / "annotations_v2.jsonl"
     hand_poses_root = root / "hand_poses"
     if not annotations_path.exists() or not hand_poses_root.exists():
@@ -275,11 +295,18 @@ def discover_full_episodes(root: Path, camera: str) -> list[SourceEpisode]:
             video_path = find_full_video(root, str(scene), sequence_id, camera)
             if video_path is None:
                 continue
+            keypoints_path, keypoints_source = find_keypoints_path(
+                sequence_root,
+                sequence_id,
+                require_real_keypoints=require_real_keypoints,
+                allow_mano_keypoint_fallback=allow_mano_keypoint_fallback,
+            )
             episodes.append(
                 SourceEpisode(
                     sequence_root=sequence_root,
                     params_path=params_path,
-                    keypoints_path=find_keypoints_path(sequence_root, sequence_id),
+                    keypoints_path=keypoints_path,
+                    keypoints_source=keypoints_source,
                     video_path=video_path,
                     camera_path=camera_path,
                     instruction=instruction,
@@ -293,7 +320,14 @@ def discover_full_episodes(root: Path, camera: str) -> list[SourceEpisode]:
     return episodes
 
 
-def discover_manifest_episodes(root: Path, manifest_path: Path, split: str) -> list[SourceEpisode]:
+def discover_manifest_episodes(
+    root: Path,
+    manifest_path: Path,
+    split: str,
+    *,
+    require_real_keypoints: bool = False,
+    allow_mano_keypoint_fallback: bool = True,
+) -> list[SourceEpisode]:
     manifest = load_json(manifest_path)
     clips = manifest.get("clips", [])
     if not isinstance(clips, list):
@@ -314,11 +348,18 @@ def discover_manifest_episodes(root: Path, manifest_path: Path, split: str) -> l
         video_path = resolve_manifest_path(root, clip.get("video_path"))
         sequence_root = root / "hand_poses" / scene
         instruction = clean_instruction(str(clip.get("instruction", scene)))
+        keypoints_path, keypoints_source = find_keypoints_path(
+            sequence_root,
+            sequence_id,
+            require_real_keypoints=require_real_keypoints,
+            allow_mano_keypoint_fallback=allow_mano_keypoint_fallback,
+        )
         episodes.append(
             SourceEpisode(
                 sequence_root=sequence_root,
                 params_path=params_path,
-                keypoints_path=find_keypoints_path(sequence_root, sequence_id),
+                keypoints_path=keypoints_path,
+                keypoints_source=keypoints_source,
                 video_path=video_path,
                 camera_path=camera_path,
                 instruction=instruction,
@@ -405,6 +446,11 @@ def load_keypoint_fallback(path: Path | None, frame_count: int) -> dict[str, np.
     if path is None:
         return None
     if path.is_dir():
+        if (path / "left.jsonl").exists() and (path / "right.jsonl").exists():
+            return {
+                "left": load_keypoint_jsonl_dir_side(path, "left", frame_count),
+                "right": load_keypoint_jsonl_dir_side(path, "right", frame_count),
+            }
         json_files = sorted(path.glob("*.json"))
         if not json_files:
             return None
@@ -423,6 +469,28 @@ def load_keypoint_fallback(path: Path | None, frame_count: int) -> dict[str, np.
     return None
 
 
+def load_keypoint_jsonl_dir_side(path: Path, side: str, frame_count: int) -> np.ndarray:
+    frames = np.full((frame_count, 21, 3), np.nan, dtype=np.float32)
+    chosen_path = path / f"chosen_frames_{side}.json"
+    if chosen_path.exists():
+        frame_ids = [int(frame_id) for frame_id in load_json(chosen_path)]
+    else:
+        frame_ids = list(range(frame_count))
+
+    with (path / f"{side}.jsonl").open("r", encoding="utf-8") as handle:
+        for row_idx, line in enumerate(handle):
+            if row_idx >= len(frame_ids):
+                break
+            frame_id = frame_ids[row_idx]
+            if frame_id < 0 or frame_id >= frame_count:
+                continue
+            points = np.asarray(json.loads(line), dtype=np.float32)
+            if points.ndim != 2 or points.shape[0] < 21 or points.shape[1] < 3:
+                continue
+            frames[frame_id] = points[:21, :3]
+    return frames
+
+
 def build_hand_dict(
     params: dict[str, np.ndarray],
     joints_worldspace: np.ndarray | None,
@@ -430,19 +498,43 @@ def build_hand_dict(
 ) -> dict[str, np.ndarray]:
     frame_count = len(extrinsics)
     global_axis_angle, hand_axis_angle, transl_worldspace, beta = normalize_pose_fields(params, frame_count)
+    params_valid = np.isfinite(transl_worldspace).all(axis=1) & np.isfinite(hand_axis_angle).all(axis=1)
+    global_axis_angle = np.where(
+        params_valid[:, None],
+        np.nan_to_num(global_axis_angle, nan=0.0, posinf=0.0, neginf=0.0),
+        0.0,
+    ).astype(np.float32)
+    hand_axis_angle = np.where(
+        params_valid[:, None],
+        np.nan_to_num(hand_axis_angle, nan=0.0, posinf=0.0, neginf=0.0),
+        0.0,
+    ).astype(np.float32)
+    transl_worldspace = np.where(
+        params_valid[:, None],
+        np.nan_to_num(transl_worldspace, nan=0.0, posinf=0.0, neginf=0.0),
+        0.0,
+    ).astype(np.float32)
+    beta = np.nan_to_num(beta, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
     global_orient_worldspace = axis_angle_to_matrix(global_axis_angle)
     hand_pose = axis_angle_to_matrix(hand_axis_angle.reshape(frame_count, 15, 3))
 
     if joints_worldspace is None:
         joints_worldspace = np.repeat(transl_worldspace[:, None, :], 21, axis=1)
     joints_worldspace = np.asarray(joints_worldspace, dtype=np.float32)[:frame_count]
+    joints_valid = np.isfinite(joints_worldspace).all(axis=(1, 2))
+    joints_worldspace = np.where(
+        joints_valid[:, None, None],
+        np.nan_to_num(joints_worldspace, nan=0.0, posinf=0.0, neginf=0.0),
+        0.0,
+    ).astype(np.float32)
 
     R_w2c = extrinsics[:, :3, :3]
     t_w2c = extrinsics[:, :3, 3]
     global_orient_camspace = R_w2c @ global_orient_worldspace
     transl_camspace = (R_w2c @ transl_worldspace[..., None])[..., 0] + t_w2c
     joints_camspace = (R_w2c @ joints_worldspace.transpose(0, 2, 1)).transpose(0, 2, 1) + t_w2c[:, None, :]
-    kept_frames = np.isfinite(transl_worldspace).all(axis=1) & np.isfinite(hand_axis_angle).all(axis=1)
+    kept_frames = params_valid & joints_valid
 
     return {
         "beta": beta.astype(np.float32),
@@ -537,7 +629,15 @@ def write_video_from_plan(plan: VideoWritePlan) -> bool:
     return True
 
 
-def build_episode(source: SourceEpisode, output_root: Path, gigahands_root: Path, camera: str, write_video: bool, undistort: bool) -> tuple[str, dict[str, Any], VideoWritePlan | None]:
+def build_episode(
+    source: SourceEpisode,
+    output_root: Path,
+    gigahands_root: Path,
+    camera: str,
+    write_video: bool,
+    undistort: bool,
+    require_real_keypoints: bool,
+) -> tuple[str, dict[str, Any], VideoWritePlan | None]:
     params = load_hand_params(source.params_path)
     total_frames = min(len(params["left"]["poses"]), len(params["right"]["poses"]))
     start = max(source.start_frame, 0)
@@ -565,11 +665,22 @@ def build_episode(source: SourceEpisode, output_root: Path, gigahands_root: Path
     extrinsics = np.repeat(extrinsic[None, ...], frame_count, axis=0).astype(np.float32)
 
     keypoints = load_keypoint_fallback(source.keypoints_path, total_frames)
+    if require_real_keypoints and source.keypoints_source != "real":
+        raise ValueError(f"Missing real keypoints for {source.sequence_name}/{source.sequence_id}")
+    if require_real_keypoints and keypoints is None:
+        raise ValueError(f"Invalid real keypoints for {source.sequence_name}/{source.sequence_id}")
     if keypoints is not None:
         keypoints = {side: value[start:end] for side, value in keypoints.items()}
 
     left = build_hand_dict(sliced_params["left"], None if keypoints is None else keypoints.get("left"), extrinsics)
     right = build_hand_dict(sliced_params["right"], None if keypoints is None else keypoints.get("right"), extrinsics)
+    keypoint_metadata = {
+        "enabled": bool(keypoints is not None),
+        "format": "3d_hand_keypoints",
+        "representation": "world_and_camera_space_joints",
+        "source": source.keypoints_source or "mano_joint_repeat",
+        "require_real_keypoints": bool(require_real_keypoints),
+    }
     clip_name = safe_name(source.video_path.stem)
     episode_id = (
         f"GigaHands_{safe_name(source.sequence_name)}_{safe_name(source.sequence_id)}_"
@@ -594,6 +705,8 @@ def build_episode(source: SourceEpisode, output_root: Path, gigahands_root: Path
         "extrinsics": extrinsics,
         "camera": camera_metadata,
         "anno_type": choose_main_hand(left, right),
+        "action_type": "keypoints",
+        "keypoints": keypoint_metadata,
         "text": {
             "left": [(instruction, (0, frame_count))],
             "right": [(instruction, (0, frame_count))],
@@ -621,10 +734,16 @@ def init_report(camera: str, undistort: bool) -> dict[str, Any]:
         "skipped_missing_video": 0,
         "skipped_missing_params": 0,
         "skipped_missing_camera": 0,
+        "skipped_missing_real_keypoints": 0,
         "skipped_short_clip": 0,
         "skipped_low_valid_ratio": 0,
         "used_mano_joints": 0,
         "used_keypoint_fallback_joints": 0,
+        "used_real_keypoints": 0,
+        "used_mano_keypoints": 0,
+        "keypoint_dimension": 3,
+        "keypoint_format": "3d_hand_keypoints",
+        "action_type": "keypoints",
         "camera": camera,
         "undistorted": False,
         "undistorted_requested": bool(undistort),
@@ -649,6 +768,8 @@ def convert_gigahands_to_vitra(
     write_video: bool = True,
     undistort: bool = False,
     clean_output: bool = False,
+    require_real_keypoints: bool = False,
+    allow_mano_keypoint_fallback: bool = True,
 ) -> dict[str, Any]:
     gigahands_root = Path(gigahands_root)
     output_root = Path(output_root)
@@ -661,9 +782,20 @@ def convert_gigahands_to_vitra(
     elif input_layout == "full":
         demo_summary = {}
         if subset_manifest is not None:
-            sources = discover_manifest_episodes(gigahands_root, Path(subset_manifest), split)
+            sources = discover_manifest_episodes(
+                gigahands_root,
+                Path(subset_manifest),
+                split,
+                require_real_keypoints=require_real_keypoints,
+                allow_mano_keypoint_fallback=allow_mano_keypoint_fallback,
+            )
         else:
-            sources = discover_full_episodes(gigahands_root, camera)
+            sources = discover_full_episodes(
+                gigahands_root,
+                camera,
+                require_real_keypoints=require_real_keypoints,
+                allow_mano_keypoint_fallback=allow_mano_keypoint_fallback,
+            )
     else:
         raise ValueError("--input_layout must be 'demo' or 'full'")
 
@@ -692,10 +824,20 @@ def convert_gigahands_to_vitra(
             report["skipped_missing_camera"] += 1
             continue
         try:
-            episode_id, episode, video_plan = build_episode(source, output_root, gigahands_root, camera, write_video, undistort)
+            episode_id, episode, video_plan = build_episode(
+                source,
+                output_root,
+                gigahands_root,
+                camera,
+                write_video,
+                undistort,
+                require_real_keypoints,
+            )
         except ValueError as exc:
             if "Camera" in str(exc):
                 report["skipped_missing_camera"] += 1
+            elif "real keypoints" in str(exc):
+                report["skipped_missing_real_keypoints"] += 1
             else:
                 report["errors"].append({"source": str(source.params_path), "error": str(exc)})
             continue
@@ -707,10 +849,13 @@ def convert_gigahands_to_vitra(
         if frame_count < min_frames:
             report["skipped_short_clip"] += 1
             continue
-        valid_ratio = min(
+        hand_valid_ratios = (
             float(np.mean(episode["left"]["kept_frames"])),
             float(np.mean(episode["right"]["kept_frames"])),
         )
+        # Keep clips where at least one hand is usable. The per-hand masks in
+        # the VITRA dataset loader suppress invalid left/right targets.
+        valid_ratio = max(hand_valid_ratios)
         if valid_ratio < min_valid_ratio:
             report["skipped_low_valid_ratio"] += 1
             continue
@@ -743,6 +888,10 @@ def convert_gigahands_to_vitra(
             report["used_mano_joints"] += 1
         else:
             report["used_keypoint_fallback_joints"] += 1
+            if source.keypoints_source == "real":
+                report["used_real_keypoints"] += 1
+            elif source.keypoints_source == "mano":
+                report["used_mano_keypoints"] += 1
 
     report["undistorted"] = bool(report["num_undistorted_videos"] > 0 and report["num_raw_copied_videos"] == 0)
 
@@ -781,6 +930,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--write_video", action="store_true")
     parser.add_argument("--undistort", action="store_true")
     parser.add_argument("--clean_output", action="store_true")
+    parser.add_argument("--require_real_keypoints", action="store_true")
+    parser.add_argument("--no_mano_keypoint_fallback", action="store_true")
     return parser.parse_args()
 
 
@@ -799,6 +950,8 @@ def main() -> None:
         write_video=args.write_video,
         undistort=args.undistort,
         clean_output=args.clean_output,
+        require_real_keypoints=args.require_real_keypoints,
+        allow_mano_keypoint_fallback=not args.no_mano_keypoint_fallback,
     )
     print(json.dumps(report, indent=2))
 

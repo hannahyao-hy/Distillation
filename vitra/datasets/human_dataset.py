@@ -863,8 +863,10 @@ def pad_state_human(
     # Expand state mask from per-hand to per-dim
     expanded_state_mask = current_state_mask.repeat_interleave(state_dim // 2)
 
-    # Mask out invalid state dimensions
-    current_state_masked = current_state * expanded_state_mask.to(current_state.dtype)
+    # Mask out invalid state dimensions. Multiplication is not enough because
+    # NaN * 0 is still NaN, and invalid GigaHands hands can carry NaN joints.
+    finite_state = torch.nan_to_num(current_state, nan=0.0, posinf=0.0, neginf=0.0)
+    current_state_masked = torch.where(expanded_state_mask, finite_state, torch.zeros_like(finite_state))
 
     # Initialize output tensors
     padded_state = torch.zeros(unified_state_dim, dtype=current_state.dtype)
@@ -924,8 +926,10 @@ def pad_action(
     # ---------------------------
 
     actions = torch.tensor(actions, dtype=torch.float32)
-    # Mask invalid action dims
-    actions_masked = actions * expanded_action_mask.to(actions.dtype)
+    # Mask invalid action dims. Use where/nan_to_num so masked invalid values
+    # cannot leak NaNs into the model.
+    finite_actions = torch.nan_to_num(actions, nan=0.0, posinf=0.0, neginf=0.0)
+    actions_masked = torch.where(expanded_action_mask, finite_actions, torch.zeros_like(finite_actions))
 
     # Pad both actions and mask
     padding = torch.zeros(

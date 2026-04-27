@@ -47,17 +47,27 @@ def sequence_aliases(sequence: str) -> list[str]:
     return list(dict.fromkeys(aliases))
 
 
-def keypoints_path_exists(sequence_root: Path, sequence_id: str) -> bool:
+def keypoints_path_exists(
+    sequence_root: Path,
+    sequence_id: str,
+    *,
+    require_real_keypoints: bool = False,
+) -> bool:
     candidates = []
     for alias in sequence_aliases(sequence_id):
         candidates.extend(
             [
-                sequence_root / "keypoints_3d_mano" / f"{alias}.json",
-                sequence_root / "keypoints_3d_mano" / alias,
                 sequence_root / "keypoints_3d" / f"{alias}.json",
                 sequence_root / "keypoints_3d" / alias,
             ]
         )
+        if not require_real_keypoints:
+            candidates.extend(
+                [
+                    sequence_root / "keypoints_3d_mano" / f"{alias}.json",
+                    sequence_root / "keypoints_3d_mano" / alias,
+                ]
+            )
     return any(path.exists() for path in candidates)
 
 
@@ -182,8 +192,10 @@ def build_candidates(
     gigahands_root: Path,
     min_frames: int,
     prefer_camera: str,
+    strict_prefer_camera: bool,
     require_both_hands_valid: bool,
     require_keypoints: bool,
+    require_real_keypoints: bool,
     prefer_bimanual_motion: bool,
     require_video_exists: bool,
     require_video_frame_count: bool,
@@ -214,19 +226,33 @@ def build_candidates(
         raw_end = int(row.get("end_frame_id", row.get("end_frame", -1)) or -1)
         params_path = gigahands_root / "hand_poses" / scene / "params" / f"{sequence_id}.json"
         sequence_root = gigahands_root / "hand_poses" / scene
-        if require_keypoints and not keypoints_path_exists(sequence_root, sequence_id):
+        if require_keypoints and not keypoints_path_exists(
+            sequence_root,
+            sequence_id,
+            require_real_keypoints=require_real_keypoints,
+        ):
             continue
-        frame_count = infer_frame_count(params_path)
+        needs_hand_params = raw_end < 0 or require_both_hands_valid or prefer_bimanual_motion
+        frame_count = infer_frame_count(params_path) if needs_hand_params else raw_end + 1
         end = min(raw_end + 1 if raw_end >= 0 else frame_count, frame_count)
         if end - start < min_frames:
             continue
 
-        valid, bimanual_motion = hand_params_valid(params_path, start, end, require_both_hands_valid)
-        if not valid:
-            continue
+        if needs_hand_params:
+            valid, bimanual_motion = hand_params_valid(params_path, start, end, require_both_hands_valid)
+            if not valid:
+                continue
+        else:
+            if not params_path.exists():
+                continue
+            bimanual_motion = 0.0
 
         map_rows = video_map.get((scene, sequence_id), [])
-        camera = choose_camera(gigahands_root, scene, sequence_id, prefer_camera, map_rows)
+        camera = (
+            prefer_camera
+            if strict_prefer_camera
+            else choose_camera(gigahands_root, scene, sequence_id, prefer_camera, map_rows)
+        )
         video_path = infer_video_path(gigahands_root, scene, sequence_id, camera, map_rows)
         if require_video_exists and not video_path.exists():
             continue
@@ -326,14 +352,18 @@ def prepare_real_subset(
     num_test: int,
     min_frames: int,
     prefer_camera: str,
+    strict_prefer_camera: bool,
     require_both_hands_valid: bool,
     require_keypoints: bool,
+    require_real_keypoints: bool,
     prefer_bimanual_motion: bool,
     require_video_exists: bool,
     require_video_frame_count: bool,
     output_manifest: str | Path,
     output_video_list: str | Path,
     candidate_pool_factor: int = 4,
+    use_all: bool = False,
+    test_ratio: float = 0.1,
 ) -> dict[str, Any]:
     gigahands_root = Path(gigahands_root)
     output_manifest = Path(output_manifest)
@@ -343,19 +373,28 @@ def prepare_real_subset(
         gigahands_root=gigahands_root,
         min_frames=min_frames,
         prefer_camera=prefer_camera,
+        strict_prefer_camera=strict_prefer_camera,
         require_both_hands_valid=require_both_hands_valid,
         require_keypoints=require_keypoints,
+        require_real_keypoints=require_real_keypoints,
         prefer_bimanual_motion=prefer_bimanual_motion,
         require_video_exists=require_video_exists,
         require_video_frame_count=require_video_frame_count,
-        target_candidates=max(num_train + num_test, (num_train + num_test) * candidate_pool_factor),
+        target_candidates=None
+        if use_all
+        else max(num_train + num_test, (num_train + num_test) * candidate_pool_factor),
     )
-    selected = candidates[: num_train + num_test]
-    if len(selected) < num_train + num_test:
-        raise ValueError(
-            f"Only found {len(selected)} eligible clips, but requested {num_train + num_test}. "
-            "Try lowering NUM_TRAIN/NUM_TEST/MIN_FRAMES, changing CAMERA, or disabling --require_video_exists."
-        )
+    if use_all:
+        selected = candidates
+        num_test = int(round(len(selected) * test_ratio))
+        num_train = max(len(selected) - num_test, 0)
+    else:
+        selected = candidates[: num_train + num_test]
+        if len(selected) < num_train + num_test:
+            raise ValueError(
+                f"Only found {len(selected)} eligible clips, but requested {num_train + num_test}. "
+                "Try lowering NUM_TRAIN/NUM_TEST/MIN_FRAMES, changing CAMERA, or disabling --require_video_exists."
+            )
     train = selected[:num_train]
     test = selected[num_train : num_train + num_test]
     for clip in train:
@@ -373,12 +412,16 @@ def prepare_real_subset(
             "num_test": num_test,
             "min_frames": min_frames,
             "prefer_camera": prefer_camera,
+            "strict_prefer_camera": strict_prefer_camera,
             "require_both_hands_valid": require_both_hands_valid,
             "require_keypoints": require_keypoints,
+            "require_real_keypoints": require_real_keypoints,
             "prefer_bimanual_motion": prefer_bimanual_motion,
             "require_video_exists": require_video_exists,
             "require_video_frame_count": require_video_frame_count,
             "candidate_pool_factor": candidate_pool_factor,
+            "use_all": use_all,
+            "test_ratio": test_ratio,
         },
         "splits": {
             "train": [clip["clip_id"] for clip in train],
@@ -408,12 +451,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_test", type=int, default=5)
     parser.add_argument("--min_frames", type=int, default=32)
     parser.add_argument("--prefer_camera", default="brics-odroid-011_cam0")
+    parser.add_argument("--strict_prefer_camera", action="store_true")
     parser.add_argument("--require_both_hands_valid", action="store_true")
     parser.add_argument("--require_keypoints", action="store_true")
+    parser.add_argument("--require_real_keypoints", action="store_true")
     parser.add_argument("--prefer_bimanual_motion", action="store_true")
     parser.add_argument("--require_video_exists", action="store_true")
     parser.add_argument("--require_video_frame_count", action="store_true")
     parser.add_argument("--candidate_pool_factor", type=int, default=4)
+    parser.add_argument("--use_all", action="store_true")
+    parser.add_argument("--test_ratio", type=float, default=0.1)
     parser.add_argument("--output_manifest", type=Path, required=True)
     parser.add_argument("--output_video_list", type=Path, required=True)
     return parser.parse_args()
@@ -427,14 +474,18 @@ def main() -> None:
         num_test=args.num_test,
         min_frames=args.min_frames,
         prefer_camera=args.prefer_camera,
+        strict_prefer_camera=args.strict_prefer_camera,
         require_both_hands_valid=args.require_both_hands_valid,
         require_keypoints=args.require_keypoints,
+        require_real_keypoints=args.require_real_keypoints,
         prefer_bimanual_motion=args.prefer_bimanual_motion,
         require_video_exists=args.require_video_exists,
         require_video_frame_count=args.require_video_frame_count,
         output_manifest=args.output_manifest,
         output_video_list=args.output_video_list,
         candidate_pool_factor=args.candidate_pool_factor,
+        use_all=args.use_all,
+        test_ratio=args.test_ratio,
     )
     print(json.dumps(report, indent=2))
 

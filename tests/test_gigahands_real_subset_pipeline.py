@@ -71,6 +71,49 @@ def write_camera(path: Path, camera_name: str = "brics-odroid-011_cam0") -> None
     path.write_text(" ".join(map(str, row)) + "\n")
 
 
+def write_keypoints(
+    path: Path,
+    frame_count: int = 40,
+    *,
+    left_offset: float = 0.0,
+    right_offset: float = 0.25,
+    invalid_frame: int | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frames = np.arange(frame_count, dtype=np.float32)[:, None, None]
+    joint_ids = np.arange(21, dtype=np.float32)[None, :, None]
+    xyz = np.array([1.0, 0.5, 0.25], dtype=np.float32)[None, None, :]
+    left = left_offset + frames * 0.01 + joint_ids * 0.001 + xyz
+    right = right_offset + frames * 0.02 + joint_ids * 0.002 + xyz
+    if invalid_frame is not None:
+        left[invalid_frame] = np.nan
+    payload = {
+        "left": left.reshape(frame_count, -1).tolist(),
+        "right": right.reshape(frame_count, -1).tolist(),
+    }
+    path.write_text(json.dumps(payload))
+
+
+def write_keypoint_jsonl_dir(
+    path: Path,
+    frame_count: int = 40,
+    *,
+    left_offset: float = 0.0,
+    right_offset: float = 0.25,
+) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for side, offset in (("left", left_offset), ("right", right_offset)):
+        frame_ids = list(range(frame_count))
+        (path / f"chosen_frames_{side}.json").write_text(json.dumps(frame_ids))
+        with (path / f"{side}.jsonl").open("w", encoding="utf-8") as handle:
+            for frame_id in frame_ids:
+                joints = []
+                for joint_id in range(21):
+                    base = offset + frame_id * 0.01 + joint_id * 0.001
+                    joints.append([base + 1.0, base + 0.5, base + 0.25, 1.0])
+                handle.write(json.dumps(joints) + "\n")
+
+
 def write_full_fixture(root: Path, count: int = 4) -> None:
     scene = "p001-box"
     sequence_root = root / "hand_poses" / scene
@@ -113,6 +156,7 @@ def test_prepare_real_subset_writes_manifest_and_needed_videos(tmp_path):
         prefer_camera="brics-odroid-011_cam0",
         require_both_hands_valid=True,
         require_keypoints=False,
+        require_real_keypoints=False,
         prefer_bimanual_motion=True,
         candidate_pool_factor=4,
         require_video_exists=False,
@@ -159,6 +203,7 @@ def test_prepare_real_subset_requires_hand_poses(tmp_path):
             prefer_camera="brics-odroid-011_cam0",
             require_both_hands_valid=True,
             require_keypoints=False,
+            require_real_keypoints=False,
             prefer_bimanual_motion=True,
             candidate_pool_factor=4,
             require_video_exists=False,
@@ -181,6 +226,7 @@ def test_prepare_real_subset_can_stop_after_small_candidate_pool(tmp_path):
         prefer_camera="brics-odroid-011_cam0",
         require_both_hands_valid=True,
         require_keypoints=False,
+        require_real_keypoints=False,
         prefer_bimanual_motion=True,
         candidate_pool_factor=1,
         require_video_exists=False,
@@ -192,6 +238,66 @@ def test_prepare_real_subset_can_stop_after_small_candidate_pool(tmp_path):
     assert report["candidates"] == 2
     assert report["selected_train"] == 1
     assert report["selected_test"] == 1
+
+
+def test_prepare_real_subset_can_use_all_candidates(tmp_path):
+    module = load_module(PREPARE_PATH, "prepare_gigahands_real_subset")
+    root = tmp_path / "GigaHands_subset_real"
+    write_full_fixture(root, count=5)
+
+    report = module.prepare_real_subset(
+        gigahands_root=root,
+        num_train=0,
+        num_test=0,
+        min_frames=32,
+        prefer_camera="brics-odroid-011_cam0",
+        require_both_hands_valid=True,
+        require_keypoints=False,
+        require_real_keypoints=False,
+        prefer_bimanual_motion=True,
+        candidate_pool_factor=1,
+        require_video_exists=False,
+        require_video_frame_count=False,
+        output_manifest=tmp_path / "subset_manifest.json",
+        output_video_list=tmp_path / "needed_videos.txt",
+        use_all=True,
+        test_ratio=0.2,
+    )
+
+    assert report["candidates"] == 5
+    assert report["selected_train"] == 4
+    assert report["selected_test"] == 1
+
+
+def test_prepare_real_subset_can_require_real_keypoints(tmp_path):
+    module = load_module(PREPARE_PATH, "prepare_gigahands_real_subset")
+    root = tmp_path / "GigaHands_subset_real"
+    write_full_fixture(root, count=3)
+    scene_root = root / "hand_poses" / "p001-box"
+    write_keypoints(scene_root / "keypoints_3d_mano" / "001.json")
+    write_keypoints(scene_root / "keypoints_3d" / "002.json")
+    write_keypoints(scene_root / "keypoints_3d_mano" / "003.json")
+
+    report = module.prepare_real_subset(
+        gigahands_root=root,
+        num_train=1,
+        num_test=0,
+        min_frames=32,
+        prefer_camera="brics-odroid-011_cam0",
+        require_both_hands_valid=True,
+        require_keypoints=True,
+        require_real_keypoints=True,
+        prefer_bimanual_motion=True,
+        candidate_pool_factor=4,
+        require_video_exists=False,
+        require_video_frame_count=False,
+        output_manifest=tmp_path / "subset_manifest.json",
+        output_video_list=tmp_path / "needed_videos.txt",
+    )
+
+    manifest = json.loads((tmp_path / "subset_manifest.json").read_text())
+    assert report["candidates"] == 1
+    assert manifest["clips"][0]["sequence_id"] == "002"
 
 
 def test_video_map_loader_falls_back_to_comma_csv_when_sniffer_fails(tmp_path, monkeypatch):
@@ -287,6 +393,262 @@ def test_converter_full_manifest_writes_train_and_test_datasets(tmp_path):
     assert report["undistorted_requested"] is False
     assert report["num_raw_copied_videos"] == 2
     assert report["num_undistorted_videos"] == 0
+
+
+def test_converter_prefers_real_keypoints_over_mano_keypoints(tmp_path):
+    converter = load_module(CONVERTER_PATH, "convert_gigahands_to_vitra_stage1")
+    root = tmp_path / "GigaHands_subset_real"
+    output_root = tmp_path / "vitra_gigahands_real_subset"
+    write_full_fixture(root, count=1)
+    scene_root = root / "hand_poses" / "p001-box"
+    write_keypoints(scene_root / "keypoints_3d" / "001.json", left_offset=10.0, right_offset=20.0)
+    write_keypoints(scene_root / "keypoints_3d_mano" / "001.json", left_offset=100.0, right_offset=200.0)
+
+    manifest = {
+        "clips": [
+            {
+                "clip_id": "train_001",
+                "split": "train",
+                "scene": "p001-box",
+                "sequence_id": "001",
+                "camera": "brics-odroid-011_cam0",
+                "instruction": "Pick up object 0 with both hands.",
+                "start_frame": 0,
+                "end_frame": 36,
+                "params_path": "hand_poses/p001-box/params/001.json",
+                "camera_path": "hand_poses/p001-box/optim_params.txt",
+                "video_path": "multiview_rgb_vids/p001-box/brics-odroid-011_cam0/brics-odroid-011_cam0_001.mp4",
+            }
+        ],
+        "splits": {"train": ["train_001"], "test": []},
+    }
+    manifest_path = root / "subset_manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+
+    report = converter.convert_gigahands_to_vitra(
+        gigahands_root=root,
+        output_root=output_root,
+        input_layout="full",
+        subset_manifest=manifest_path,
+        split="all",
+        camera="auto",
+        dataset_name_prefix="gigahands_real",
+        min_frames=17,
+        min_valid_ratio=0.9,
+        write_video=False,
+    )
+
+    train_episodes = list((output_root / "Annotation" / "gigahands_real_train" / "episodic_annotations").glob("*.npy"))
+    epi = np.load(train_episodes[0], allow_pickle=True).item()
+    assert report["used_keypoint_fallback_joints"] == 1
+    np.testing.assert_allclose(epi["left"]["joints_worldspace"][0, 0], np.array([11.0, 10.5, 10.25], dtype=np.float32))
+    np.testing.assert_allclose(epi["right"]["joints_worldspace"][0, 0], np.array([21.0, 20.5, 20.25], dtype=np.float32))
+
+
+def test_converter_loads_official_real_keypoint_jsonl_dir(tmp_path):
+    converter = load_module(CONVERTER_PATH, "convert_gigahands_to_vitra_stage1")
+    root = tmp_path / "GigaHands_subset_real"
+    output_root = tmp_path / "vitra_gigahands_real_subset"
+    write_full_fixture(root, count=1)
+    scene_root = root / "hand_poses" / "p001-box"
+    write_keypoint_jsonl_dir(scene_root / "keypoints_3d" / "001", left_offset=10.0, right_offset=20.0)
+
+    manifest = {
+        "clips": [
+            {
+                "clip_id": "train_001",
+                "split": "train",
+                "scene": "p001-box",
+                "sequence_id": "001",
+                "camera": "brics-odroid-011_cam0",
+                "instruction": "Pick up object 0 with both hands.",
+                "start_frame": 0,
+                "end_frame": 36,
+                "params_path": "hand_poses/p001-box/params/001.json",
+                "camera_path": "hand_poses/p001-box/optim_params.txt",
+                "video_path": "multiview_rgb_vids/p001-box/brics-odroid-011_cam0/brics-odroid-011_cam0_001.mp4",
+            }
+        ],
+        "splits": {"train": ["train_001"], "test": []},
+    }
+    manifest_path = root / "subset_manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+
+    report = converter.convert_gigahands_to_vitra(
+        gigahands_root=root,
+        output_root=output_root,
+        input_layout="full",
+        subset_manifest=manifest_path,
+        split="all",
+        camera="auto",
+        dataset_name_prefix="gigahands_real",
+        min_frames=17,
+        min_valid_ratio=0.9,
+        write_video=False,
+        require_real_keypoints=True,
+        allow_mano_keypoint_fallback=False,
+    )
+
+    train_episodes = list((output_root / "Annotation" / "gigahands_real_train" / "episodic_annotations").glob("*.npy"))
+    epi = np.load(train_episodes[0], allow_pickle=True).item()
+    assert report["used_real_keypoints"] == 1
+    np.testing.assert_allclose(epi["left"]["joints_worldspace"][0, 0], np.array([11.0, 10.5, 10.25], dtype=np.float32))
+    np.testing.assert_allclose(epi["right"]["joints_worldspace"][0, 0], np.array([21.0, 20.5, 20.25], dtype=np.float32))
+
+
+def test_converter_can_require_real_keypoints_and_reject_mano_only(tmp_path):
+    converter = load_module(CONVERTER_PATH, "convert_gigahands_to_vitra_stage1")
+    root = tmp_path / "GigaHands_subset_real"
+    output_root = tmp_path / "vitra_gigahands_real_subset"
+    write_full_fixture(root, count=1)
+    scene_root = root / "hand_poses" / "p001-box"
+    write_keypoints(scene_root / "keypoints_3d_mano" / "001.json", left_offset=100.0, right_offset=200.0)
+
+    manifest = {
+        "clips": [
+            {
+                "clip_id": "train_001",
+                "split": "train",
+                "scene": "p001-box",
+                "sequence_id": "001",
+                "camera": "brics-odroid-011_cam0",
+                "instruction": "Pick up object 0 with both hands.",
+                "start_frame": 0,
+                "end_frame": 36,
+                "params_path": "hand_poses/p001-box/params/001.json",
+                "camera_path": "hand_poses/p001-box/optim_params.txt",
+                "video_path": "multiview_rgb_vids/p001-box/brics-odroid-011_cam0/brics-odroid-011_cam0_001.mp4",
+            }
+        ],
+        "splits": {"train": ["train_001"], "test": []},
+    }
+    manifest_path = root / "subset_manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+
+    report = converter.convert_gigahands_to_vitra(
+        gigahands_root=root,
+        output_root=output_root,
+        input_layout="full",
+        subset_manifest=manifest_path,
+        split="all",
+        camera="auto",
+        dataset_name_prefix="gigahands_real",
+        min_frames=17,
+        min_valid_ratio=0.9,
+        write_video=False,
+        require_real_keypoints=True,
+    )
+
+    assert report["num_episodes_written"] == 0
+    assert report["skipped_missing_real_keypoints"] == 1
+
+
+def test_converter_filters_invalid_real_keypoint_frames_from_kept_mask(tmp_path):
+    converter = load_module(CONVERTER_PATH, "convert_gigahands_to_vitra_stage1")
+    root = tmp_path / "GigaHands_subset_real"
+    output_root = tmp_path / "vitra_gigahands_real_subset"
+    write_full_fixture(root, count=1)
+    scene_root = root / "hand_poses" / "p001-box"
+    write_keypoints(scene_root / "keypoints_3d" / "001.json", invalid_frame=5)
+
+    manifest = {
+        "clips": [
+            {
+                "clip_id": "train_001",
+                "split": "train",
+                "scene": "p001-box",
+                "sequence_id": "001",
+                "camera": "brics-odroid-011_cam0",
+                "instruction": "Pick up object 0 with both hands.",
+                "start_frame": 0,
+                "end_frame": 36,
+                "params_path": "hand_poses/p001-box/params/001.json",
+                "camera_path": "hand_poses/p001-box/optim_params.txt",
+                "video_path": "multiview_rgb_vids/p001-box/brics-odroid-011_cam0/brics-odroid-011_cam0_001.mp4",
+            }
+        ],
+        "splits": {"train": ["train_001"], "test": []},
+    }
+    manifest_path = root / "subset_manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+
+    converter.convert_gigahands_to_vitra(
+        gigahands_root=root,
+        output_root=output_root,
+        input_layout="full",
+        subset_manifest=manifest_path,
+        split="all",
+        camera="auto",
+        dataset_name_prefix="gigahands_real",
+        min_frames=17,
+        min_valid_ratio=0.9,
+        write_video=False,
+        require_real_keypoints=True,
+    )
+
+    train_episodes = list((output_root / "Annotation" / "gigahands_real_train" / "episodic_annotations").glob("*.npy"))
+    epi = np.load(train_episodes[0], allow_pickle=True).item()
+    assert bool(epi["left"]["kept_frames"][5]) is False
+    assert bool(epi["right"]["kept_frames"][5]) is True
+    assert np.isfinite(epi["left"]["joints_worldspace"]).all()
+    assert np.isfinite(epi["left"]["joints_camspace"]).all()
+    np.testing.assert_allclose(epi["left"]["joints_worldspace"][5], np.zeros((21, 3), dtype=np.float32))
+
+
+def test_converter_keeps_clip_when_only_one_hand_has_valid_keypoints(tmp_path):
+    converter = load_module(CONVERTER_PATH, "convert_gigahands_to_vitra_stage1")
+    root = tmp_path / "GigaHands_subset_real"
+    output_root = tmp_path / "vitra_gigahands_real_subset"
+    write_full_fixture(root, count=1)
+    scene_root = root / "hand_poses" / "p001-box"
+    write_keypoints(scene_root / "keypoints_3d" / "001.json")
+    payload = json.loads((scene_root / "keypoints_3d" / "001.json").read_text())
+    payload["right"] = (np.full((40, 63), np.nan, dtype=np.float32)).tolist()
+    (scene_root / "keypoints_3d" / "001.json").write_text(json.dumps(payload))
+
+    manifest = {
+        "clips": [
+            {
+                "clip_id": "train_001",
+                "split": "train",
+                "scene": "p001-box",
+                "sequence_id": "001",
+                "camera": "brics-odroid-011_cam0",
+                "instruction": "Pick up object with the visible hand.",
+                "start_frame": 0,
+                "end_frame": 36,
+                "params_path": "hand_poses/p001-box/params/001.json",
+                "camera_path": "hand_poses/p001-box/optim_params.txt",
+                "video_path": "multiview_rgb_vids/p001-box/brics-odroid-011_cam0/brics-odroid-011_cam0_001.mp4",
+            }
+        ],
+        "splits": {"train": ["train_001"], "test": []},
+    }
+    manifest_path = root / "subset_manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+
+    report = converter.convert_gigahands_to_vitra(
+        gigahands_root=root,
+        output_root=output_root,
+        input_layout="full",
+        subset_manifest=manifest_path,
+        split="all",
+        camera="auto",
+        dataset_name_prefix="gigahands_real",
+        min_frames=17,
+        min_valid_ratio=0.9,
+        write_video=False,
+        require_real_keypoints=True,
+    )
+
+    train_episodes = list((output_root / "Annotation" / "gigahands_real_train" / "episodic_annotations").glob("*.npy"))
+    assert report["num_episodes_written"] == 1
+    epi = np.load(train_episodes[0], allow_pickle=True).item()
+    assert np.mean(epi["left"]["kept_frames"]) >= 0.9
+    assert np.mean(epi["right"]["kept_frames"]) == 0.0
+    assert np.isfinite(epi["right"]["joints_worldspace"]).all()
+    assert np.isfinite(epi["right"]["joints_camspace"]).all()
+    np.testing.assert_allclose(epi["right"]["joints_worldspace"], np.zeros_like(epi["right"]["joints_worldspace"]))
 
 
 def test_converted_real_train_split_can_be_read_by_frame_dataset_without_images(tmp_path):

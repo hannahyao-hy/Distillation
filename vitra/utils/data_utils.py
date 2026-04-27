@@ -112,6 +112,8 @@ class PaddedCollatorForActionPrediction:
             dataset_names = [instance["dataset_name"] for instance in instances]
         else:
             dataset_names = None
+        raw_images = [instance["raw_image"] for instance in instances] if "raw_image" in instances[0] else None
+        instructions = [instance["instruction"] for instance in instances] if "instruction" in instances[0] else None
 
 
         if self.padding_side == "right":  
@@ -184,6 +186,8 @@ class PaddedCollatorForHandPrediction:
             dataset_names = [instance["dataset_name"] for instance in instances]
         else:
             dataset_names = None
+        raw_images = [instance["raw_image"] for instance in instances] if "raw_image" in instances[0] else None
+        instructions = [instance["instruction"] for instance in instances] if "instruction" in instances[0] else None
 
         if self.padding_side == "right":  
             input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.pad_token_id)
@@ -257,6 +261,10 @@ class PaddedCollatorForHandPrediction:
 
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+        if raw_images is not None:
+            output["raw_images"] = raw_images
+        if instructions is not None:
+            output["instructions"] = instructions
     
         return output
 

@@ -178,6 +178,8 @@ class FrameDataset(Dataset):
             input_ids=input_ids,
             labels=labels,
             dataset_name=self.dataset_name,
+            raw_image=img,
+            instruction=lang,
             actions=data["action_list"],
             action_masks=data["action_mask"],
             current_state_mask=data["current_state_mask"],

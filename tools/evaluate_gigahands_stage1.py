@@ -5,11 +5,18 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+
+repo_root = Path(__file__).resolve().parents[1]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from vitra.utils.config_utils import load_config
 
 
 FINGER_CHAINS = [
@@ -1118,11 +1125,6 @@ def series_points(values: np.ndarray, x0: int, y0: int, width: int, height: int,
     return np.stack([xs, ys], axis=1).astype(np.int32)
 
 
-def load_config(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
 def set_eval_seed(seed: int) -> None:
     import torch
 
@@ -1193,7 +1195,7 @@ def select_eval_indices(dataset, args: argparse.Namespace) -> list[int]:
     return selected
 
 
-def collect_predictions(args: argparse.Namespace, model, dataset) -> dict[str, Any]:
+def collect_predictions(args: argparse.Namespace, model, dataset, eval_indices: list[int] | None = None) -> dict[str, Any]:
     import torch
 
     set_eval_seed(args.seed)
@@ -1206,7 +1208,7 @@ def collect_predictions(args: argparse.Namespace, model, dataset) -> dict[str, A
     states: list[np.ndarray] = []
     data_ids: list[int] = []
 
-    eval_indices = select_eval_indices(dataset, args)
+    eval_indices = select_eval_indices(dataset, args) if eval_indices is None else [int(idx) for idx in eval_indices]
     with torch.no_grad():
         for data_id in eval_indices:
             raw_sample = dataset.episodic_dataset_core.__getitem__(data_id)
@@ -1257,17 +1259,123 @@ def collect_predictions(args: argparse.Namespace, model, dataset) -> dict[str, A
     }
 
 
-def evaluate_checkpoint(args: argparse.Namespace, config: dict[str, Any], dataset, checkpoint: str) -> dict[str, Any]:
+def evaluate_checkpoint(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    dataset,
+    checkpoint: str,
+    eval_indices: list[int] | None = None,
+) -> dict[str, Any]:
     import gc
     import torch
 
     model = load_eval_model(config, checkpoint)
     try:
-        return collect_predictions(args, model, dataset)
+        return collect_predictions(args, model, dataset, eval_indices=eval_indices)
     finally:
         del model
         gc.collect()
         torch.cuda.empty_cache()
+
+
+def prepare_cognition_inputs(model, sample: dict[str, Any], current_state, current_state_mask, fov):
+    import torch
+    from PIL import Image
+
+    image = sample["image_list"][-1]
+    if isinstance(image, np.ndarray):
+        image = Image.fromarray(image)
+    model_inputs = model.processor(text="<image>" + sample["instruction"], images=image, return_tensors="pt").to("cuda")
+    pixel_values = model_inputs["pixel_values"]
+    input_ids = model_inputs["input_ids"]
+    if isinstance(pixel_values, torch.Tensor):
+        pixel_values = pixel_values.to("cuda")
+    elif isinstance(pixel_values, dict):
+        pixel_values = {
+            key: torch.stack([pixel_values[idx][key] for idx in range(len(input_ids))]).to("cuda")
+            for key in pixel_values[0]
+        }
+    else:
+        raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
+    if pixel_values.dim() == 5:
+        pixel_values = pixel_values.view(-1, *pixel_values.shape[2:])
+    return {
+        "pixel_values": pixel_values,
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device),
+        "current_state_mask": current_state_mask.to(input_ids.device),
+        "current_state": current_state.to(input_ids.device),
+        "fov": fov.to(input_ids.device) if fov is not None else None,
+    }
+
+
+def collect_cognition_features(args: argparse.Namespace, model, dataset, eval_indices: list[int]) -> np.ndarray:
+    import torch
+
+    set_eval_seed(args.seed)
+    features: list[np.ndarray] = []
+    with torch.no_grad():
+        for data_id in eval_indices:
+            raw_sample = dataset.episodic_dataset_core.__getitem__(int(data_id))
+            sample = dataset.episodic_dataset_core.transform_trajectory(raw_sample.copy(), normalization=True)
+            current_state = tensor_on_cuda(sample["current_state"], torch.float32)
+            current_state_mask = tensor_on_cuda(sample["current_state_mask"], torch.bool)
+            fov = tensor_on_cuda(sample["fov"], torch.float32)
+            model_inputs = prepare_cognition_inputs(model, sample, current_state, current_state_mask, fov)
+            feature = model.extract_cognition_features(**model_inputs)
+            features.append(feature.detach().float().cpu().numpy())
+    return np.concatenate(features, axis=0)
+
+
+def compute_feature_alignment(candidate_features: np.ndarray, teacher_features: np.ndarray) -> dict[str, float]:
+    candidate = np.asarray(candidate_features, dtype=np.float32)
+    teacher = np.asarray(teacher_features, dtype=np.float32)
+    if candidate.shape != teacher.shape:
+        raise ValueError(f"feature shape mismatch: {candidate.shape} vs {teacher.shape}")
+    candidate_flat = candidate.reshape(candidate.shape[0], -1)
+    teacher_flat = teacher.reshape(teacher.shape[0], -1)
+    denom = np.linalg.norm(candidate_flat, axis=1) * np.linalg.norm(teacher_flat, axis=1)
+    cosine = np.divide(
+        np.sum(candidate_flat * teacher_flat, axis=1),
+        denom,
+        out=np.zeros(candidate_flat.shape[0], dtype=np.float32),
+        where=denom > 0,
+    )
+    return {
+        "vlm_cognition_mse": float(np.mean((candidate - teacher) ** 2)),
+        "vlm_cognition_cosine": float(np.mean(cosine)),
+    }
+
+
+def feature_alignment_to_teacher(
+    args: argparse.Namespace,
+    teacher_config: dict[str, Any],
+    candidate_config: dict[str, Any],
+    dataset,
+    eval_indices: list[int],
+    candidate_checkpoint: str,
+    teacher_checkpoint: str,
+) -> dict[str, float]:
+    import gc
+    import torch
+
+    teacher_model = load_eval_model(teacher_config, teacher_checkpoint)
+    try:
+        teacher_features = collect_cognition_features(args, teacher_model, dataset, eval_indices)
+    finally:
+        del teacher_model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    candidate_model = load_eval_model(candidate_config, candidate_checkpoint)
+    try:
+        candidate_features = collect_cognition_features(args, candidate_model, dataset, eval_indices)
+    finally:
+        del candidate_model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    return compute_feature_alignment(candidate_features, teacher_features)
 
 
 def metric_comparison(before: dict[str, float], after: dict[str, float]) -> dict[str, dict[str, float]]:
@@ -1280,6 +1388,72 @@ def metric_comparison(before: dict[str, float], after: dict[str, float]) -> dict
         delta[key] = float(after_value - before_value)
         relative_improvement[key] = 0.0 if abs(before_value) < 1e-12 else float((before_value - after_value) / before_value)
     return {"delta_after_minus_before": delta, "relative_improvement": relative_improvement}
+
+
+def triad_summary(
+    *,
+    teacher_checkpoint: str,
+    base_checkpoint: str,
+    distilled_checkpoint: str,
+    teacher_action_metrics: dict[str, float],
+    base_action_metrics: dict[str, float],
+    distilled_action_metrics: dict[str, float],
+    base_feature_alignment: dict[str, float],
+    distilled_feature_alignment: dict[str, float],
+    data_ids: list[int],
+    base_vs_teacher_action: dict[str, float] | None = None,
+    distilled_vs_teacher_action: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    summary = {
+        "data_ids": [int(idx) for idx in data_ids],
+        "teacher": {
+            "checkpoint": teacher_checkpoint,
+            "action_metrics": teacher_action_metrics,
+        },
+        "base3b": {
+            "checkpoint": base_checkpoint,
+            "action_metrics": base_action_metrics,
+            "feature_alignment_to_teacher": base_feature_alignment,
+        },
+        "base_3b_student_probe": {
+            "checkpoint": base_checkpoint,
+            "action_metrics": base_action_metrics,
+            "feature_alignment_to_teacher": base_feature_alignment,
+        },
+        "distilled": {
+            "checkpoint": distilled_checkpoint,
+            "action_metrics": distilled_action_metrics,
+            "feature_alignment_to_teacher": distilled_feature_alignment,
+        },
+        "deltas": {
+            "distilled_vs_base3b_action": metric_comparison(base_action_metrics, distilled_action_metrics),
+            "distilled_vs_teacher_action": metric_comparison(teacher_action_metrics, distilled_action_metrics),
+            "distilled_vs_base3b_feature_alignment": metric_comparison(
+                base_feature_alignment,
+                distilled_feature_alignment,
+            ),
+        },
+    }
+    if base_vs_teacher_action is not None:
+        summary["base3b"]["action_metrics_vs_teacher_action"] = base_vs_teacher_action
+        summary["base_3b_student_probe"]["action_metrics_vs_teacher_action"] = base_vs_teacher_action
+    if distilled_vs_teacher_action is not None:
+        summary["distilled"]["action_metrics_vs_teacher_action"] = distilled_vs_teacher_action
+    return summary
+
+
+def prediction_metrics_vs_teacher_action(candidate: dict[str, Any], teacher: dict[str, Any]) -> dict[str, float]:
+    if "predictions" not in candidate or "predictions" not in teacher:
+        return {}
+    if len(candidate["predictions"]) != len(teacher["predictions"]):
+        raise ValueError("candidate and teacher prediction counts differ")
+    if len(candidate["predictions"]) == 0:
+        return {}
+    return compute_action_metrics(
+        np.stack(candidate["predictions"]),
+        np.stack(teacher["predictions"]),
+        np.stack(candidate["masks"]),
+    )
 
 
 def write_demo_videos(
@@ -1671,13 +1845,127 @@ def run_model_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     if args.mano_motion_videos or args.rgb_overlay_videos:
         args.mano_model_path = validate_mano_model_path(args.mano_model_path)
 
-    config = load_config(args.config)
+    config = load_config(str(args.config))
     config["train_dataset"]["data_root_dir"] = str(args.dataset_root)
     config["train_dataset"]["data_mix"] = args.data_mix
+    teacher_config_path = getattr(args, "teacher_config", None)
+    base_config_path = getattr(args, "base_config_file", None)
+    checkpoint_config_path = getattr(args, "checkpoint_config", None)
+    teacher_config = load_config(str(teacher_config_path)) if teacher_config_path is not None else config
+    base_config = load_config(str(base_config_path)) if base_config_path is not None else config
+    checkpoint_config = load_config(str(checkpoint_config_path)) if checkpoint_config_path is not None else config
+    for model_config in (teacher_config, base_config, checkpoint_config):
+        model_config["train_dataset"]["data_root_dir"] = str(args.dataset_root)
+        model_config["train_dataset"]["data_mix"] = args.data_mix
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset = build_eval_dataset(args, config)
+
+    if args.teacher_checkpoint is not None or args.base_checkpoint is not None:
+        if args.teacher_checkpoint is None or args.base_checkpoint is None:
+            raise ValueError("--teacher_checkpoint and --base_checkpoint must be passed together for triad evaluation")
+        eval_indices = select_eval_indices(dataset, args)
+        data_ids_payload = {"data_ids": [int(idx) for idx in eval_indices]}
+        (output_dir / "data_ids.json").write_text(json.dumps(data_ids_payload, indent=2), encoding="utf-8")
+
+        teacher = evaluate_checkpoint(args, teacher_config, dataset, args.teacher_checkpoint, eval_indices=eval_indices)
+        base = evaluate_checkpoint(args, base_config, dataset, args.base_checkpoint, eval_indices=eval_indices)
+        distilled = evaluate_checkpoint(args, checkpoint_config, dataset, args.checkpoint, eval_indices=eval_indices)
+        base_alignment = feature_alignment_to_teacher(
+            args,
+            teacher_config,
+            base_config,
+            dataset,
+            eval_indices,
+            args.base_checkpoint,
+            args.teacher_checkpoint,
+        )
+        distilled_alignment = feature_alignment_to_teacher(
+            args,
+            teacher_config,
+            checkpoint_config,
+            dataset,
+            eval_indices,
+            args.checkpoint,
+            args.teacher_checkpoint,
+        )
+        base_vs_teacher_action = prediction_metrics_vs_teacher_action(base, teacher)
+        distilled_vs_teacher_action = prediction_metrics_vs_teacher_action(distilled, teacher)
+        summary = triad_summary(
+            teacher_checkpoint=args.teacher_checkpoint,
+            base_checkpoint=args.base_checkpoint,
+            distilled_checkpoint=args.checkpoint,
+            teacher_action_metrics=teacher["metrics"],
+            base_action_metrics=base["metrics"],
+            distilled_action_metrics=distilled["metrics"],
+            base_feature_alignment=base_alignment,
+            distilled_feature_alignment=distilled_alignment,
+            data_ids=eval_indices,
+            base_vs_teacher_action=base_vs_teacher_action,
+            distilled_vs_teacher_action=distilled_vs_teacher_action,
+        )
+        (output_dir / "metrics_teacher.json").write_text(json.dumps(teacher["metrics"], indent=2), encoding="utf-8")
+        (output_dir / "metrics_base3b.json").write_text(json.dumps(base["metrics"], indent=2), encoding="utf-8")
+        (output_dir / "metrics_base_3b_student_probe.json").write_text(
+            json.dumps(
+                {
+                    "action_metrics": base["metrics"],
+                    "feature_alignment_to_teacher": base_alignment,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        (output_dir / "metrics_distilled.json").write_text(json.dumps(distilled["metrics"], indent=2), encoding="utf-8")
+        (output_dir / "metrics.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        if not args.no_videos:
+            write_demo_videos(
+                output_dir,
+                {
+                    args.teacher_label: teacher,
+                    args.base_label: base,
+                    args.label: distilled,
+                },
+                args.label,
+            )
+        if args.hand_motion_videos:
+            write_hand_motion_videos(
+                output_dir,
+                {
+                    args.teacher_label: teacher,
+                    args.base_label: base,
+                    args.label: distilled,
+                },
+                args.label,
+            )
+        if args.mano_motion_videos:
+            write_mano_motion_videos(
+                output_dir,
+                {
+                    args.teacher_label: teacher,
+                    args.base_label: base,
+                    args.label: distilled,
+                },
+                args.label,
+                args.mano_model_path,
+            )
+        if args.rgb_overlay_videos:
+            write_rgb_overlay_videos(
+                output_dir,
+                {
+                    args.teacher_label: teacher,
+                    args.base_label: base,
+                    args.label: distilled,
+                },
+                args.label,
+                dataset,
+                args.mano_model_path,
+                undistort_overlay_frames=args.undistort_overlay_frames,
+                keypoint_overlay_debug=args.keypoint_overlay_debug,
+                mano_param_overlay_debug=args.mano_param_overlay_debug,
+            )
+        return summary
 
     if args.baseline_checkpoint is not None:
         before = evaluate_checkpoint(args, config, dataset, args.baseline_checkpoint)
@@ -1772,6 +2060,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label", default="trained")
     parser.add_argument("--baseline_checkpoint", default=None)
     parser.add_argument("--baseline_label", default="base")
+    parser.add_argument("--teacher_checkpoint", default=None)
+    parser.add_argument("--teacher_label", default="gigahands_teacher")
+    parser.add_argument("--teacher_config", default=None)
+    parser.add_argument("--base_checkpoint", default=None)
+    parser.add_argument("--base_label", default="base3b")
+    parser.add_argument("--base_config_file", default=None)
+    parser.add_argument("--checkpoint_config", default=None)
     parser.add_argument("--num_eval_clips", type=int, default=5)
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--num_ddim_steps", type=int, default=10)

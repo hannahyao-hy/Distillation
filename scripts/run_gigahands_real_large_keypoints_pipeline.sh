@@ -25,9 +25,12 @@ NUM_TEST="${NUM_TEST:-100}"
 MIN_FRAMES="${MIN_FRAMES:-32}"
 CAMERA="${CAMERA:-brics-odroid-011_cam0}"
 CANDIDATE_POOL_FACTOR="${CANDIDATE_POOL_FACTOR:-20}"
+STRICT_CAMERA="${STRICT_CAMERA:-1}"
 REQUIRE_VIDEO_EXISTS="${REQUIRE_VIDEO_EXISTS:-1}"
 REQUIRE_VIDEO_FRAME_COUNT="${REQUIRE_VIDEO_FRAME_COUNT:-1}"
 REQUIRE_KEYPOINTS="${REQUIRE_KEYPOINTS:-1}"
+REQUIRE_REAL_KEYPOINTS="${REQUIRE_REAL_KEYPOINTS:-1}"
+ALLOW_MANO_KEYPOINT_FALLBACK="${ALLOW_MANO_KEYPOINT_FALLBACK:-0}"
 MAX_STEPS="${MAX_STEPS:-65000}"
 SAVE_STEPS="${SAVE_STEPS:-4000}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
@@ -71,12 +74,14 @@ prepare_subset() {
     --num_test "${NUM_TEST}" \
     --min_frames "${MIN_FRAMES}" \
     --prefer_camera "${CAMERA}" \
+    $(if [[ "${STRICT_CAMERA}" == "1" ]]; then echo "--strict_prefer_camera"; fi) \
     --require_both_hands_valid \
     --prefer_bimanual_motion \
     --candidate_pool_factor "${CANDIDATE_POOL_FACTOR}" \
     --output_manifest "${MANIFEST}" \
     --output_video_list "${VIDEO_LIST}" \
     $(if [[ "${REQUIRE_KEYPOINTS}" == "1" ]]; then echo "--require_keypoints"; fi) \
+    $(if [[ "${REQUIRE_REAL_KEYPOINTS}" == "1" ]]; then echo "--require_real_keypoints"; fi) \
     $(if [[ "${REQUIRE_VIDEO_EXISTS}" == "1" ]]; then echo "--require_video_exists"; fi) \
     $(if [[ "${REQUIRE_VIDEO_FRAME_COUNT}" == "1" ]]; then echo "--require_video_frame_count"; fi)
   make_unique_video_list
@@ -107,6 +112,8 @@ convert_undistorted() {
     --split all \
     --camera auto \
     --dataset_name_prefix gigahands_real \
+    --require_real_keypoints \
+    $(if [[ "${ALLOW_MANO_KEYPOINT_FALLBACK}" == "0" ]]; then echo "--no_mano_keypoint_fallback"; fi) \
     --write_video \
     --undistort \
     --clean_output
@@ -122,6 +129,8 @@ convert_linked() {
     --split all \
     --camera auto \
     --dataset_name_prefix gigahands_real \
+    --require_real_keypoints \
+    $(if [[ "${ALLOW_MANO_KEYPOINT_FALLBACK}" == "0" ]]; then echo "--no_mano_keypoint_fallback"; fi) \
     --clean_output
   rm -rf "${OUTPUT_ROOT}/Video/GigaHands_root"
   mkdir -p "${OUTPUT_ROOT}/Video"

@@ -162,6 +162,70 @@ class VITRA_Paligemma(nn.Module):
         if self.cognition_token is not None:
             self.cognition_token.requires_grad_(True)
 
+    def trainable_params_setup_for_vlm_distill(self, freeze_option: str = "freeze_vision_encoder"):
+        """Configure trainable parameters for cognition-token VLM distillation."""
+        model = self.model
+        model.config.use_cache = False
+
+        self.requires_grad_(False)
+
+        if freeze_option == "action_head_only_strict":
+            if self.act_model is not None:
+                self.act_model.requires_grad_(True)
+            return
+
+        if freeze_option == "action_head_plus_adapters":
+            if self.act_model is not None:
+                self.act_model.requires_grad_(True)
+            if self.use_state == 'VLM':
+                self.vlm_state_encoder.requires_grad_(True)
+            if self.use_fov:
+                self.fov_encoder.requires_grad_(True)
+            if self.cognition_token is not None:
+                self.cognition_token.requires_grad_(True)
+            return
+
+        if freeze_option == "action_head_plus_vlm_small_lr":
+            model.requires_grad_(True)
+            self.vision_tower.requires_grad_(False)
+            self.word_embedding.requires_grad_(True)
+            if self.act_model is not None:
+                self.act_model.requires_grad_(True)
+            if self.use_state == 'VLM':
+                self.vlm_state_encoder.requires_grad_(True)
+            if self.use_fov:
+                self.fov_encoder.requires_grad_(True)
+            if self.cognition_token is not None:
+                self.cognition_token.requires_grad_(True)
+            return
+
+        if freeze_option == "full_finetune":
+            model.requires_grad_(True)
+            self.vision_tower.requires_grad_(True)
+            self.word_embedding.requires_grad_(True)
+        elif freeze_option == "freeze_vision_encoder":
+            model.requires_grad_(True)
+            self.vision_tower.requires_grad_(False)
+            self.word_embedding.requires_grad_(True)
+        elif freeze_option == "only_head_and_token":
+            model.requires_grad_(False)
+            self.vision_tower.requires_grad_(False)
+            self.word_embedding.requires_grad_(False)
+        else:
+            raise ValueError(f"Unsupported VLM distill freeze option: {freeze_option}")
+
+        if self.act_model is not None:
+            self.act_model.requires_grad_(False)
+
+        if self.use_state == 'VLM':
+            self.vlm_state_encoder.requires_grad_(True)
+
+        if self.use_fov:
+            self.fov_encoder.requires_grad_(True)
+
+        if self.cognition_token is not None:
+            self.cognition_token.requires_grad_(True)
+
     @property
     def image_processor(self):
         return self.model.processor
@@ -367,6 +431,7 @@ class VITRA_Paligemma(nn.Module):
         current_state: Optional[torch.FloatTensor] = None,
         fov: Optional[torch.FloatTensor] = None,
         use_cache: bool = False,
+        return_hidden_states: bool = False,
         **kwargs,
     ):
 
@@ -390,7 +455,67 @@ class VITRA_Paligemma(nn.Module):
             )
 
         output_hs = outputs.hidden_states[-1]
+        if return_hidden_states:
+            return output_hs, inputs_masks, outputs.hidden_states
         return output_hs, inputs_masks
+
+    def extract_vitkd_features(
+        self,
+        pixel_values: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+        current_state_mask: Optional[torch.BoolTensor] = None,
+        current_state: Optional[torch.FloatTensor] = None,
+        fov: Optional[torch.FloatTensor] = None,
+        shallow_layers: Optional[List[int]] = None,
+        deep_layer: int = -1,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> dict:
+        shallow_layers = shallow_layers or [0, 1]
+        output_hs, inputs_masks, hidden_states = self.prepare_vlm_features(
+            pixel_values,
+            input_ids,
+            attention_mask,
+            current_state_mask,
+            current_state,
+            fov,
+            use_cache,
+            return_hidden_states=True,
+            **kwargs,
+        )
+        layer_outputs = hidden_states[1:]
+        shallow_features = [layer_outputs[idx] for idx in shallow_layers]
+        deep_feature = layer_outputs[deep_layer]
+        return {
+            "cognition": self.extract_cognition_token(output_hs, inputs_masks).squeeze(1),
+            "shallow_features": shallow_features,
+            "deep_feature": deep_feature,
+            "token_mask": inputs_masks,
+        }
+
+    def extract_cognition_features(
+        self,
+        pixel_values: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+        current_state_mask: Optional[torch.BoolTensor] = None,
+        current_state: Optional[torch.FloatTensor] = None,
+        fov: Optional[torch.FloatTensor] = None,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        output_hs, inputs_masks = self.prepare_vlm_features(
+            pixel_values,
+            input_ids,
+            attention_mask,
+            current_state_mask,
+            current_state,
+            fov,
+            use_cache,
+            **kwargs,
+        )
+        return self.extract_cognition_token(output_hs, inputs_masks).squeeze(1)
 
     def forward(
         self,
@@ -407,6 +532,30 @@ class VITRA_Paligemma(nn.Module):
         mode="train",
         **kwargs,
     ):
+
+        if mode == "vlm_cognition":
+            return self.extract_cognition_features(
+                pixel_values,
+                input_ids,
+                attention_mask=attention_mask,
+                current_state_mask=current_state_mask,
+                current_state=current_state,
+                fov=fov,
+                use_cache=use_cache,
+                **kwargs,
+            )
+
+        if mode == "vitkd_features":
+            return self.extract_vitkd_features(
+                pixel_values,
+                input_ids,
+                attention_mask=attention_mask,
+                current_state_mask=current_state_mask,
+                current_state=current_state,
+                fov=fov,
+                use_cache=use_cache,
+                **kwargs,
+            )
 
         assert mode == "train", f"mode {mode} not supported in the forward function."
 
