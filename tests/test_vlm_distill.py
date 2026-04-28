@@ -4,10 +4,17 @@ import sys
 from argparse import Namespace
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
 
-from scripts.train_vlm_distill import RunningLossNormalizer, cognition_distill_metrics, save_student_checkpoint, vitkd_distill_losses
+from scripts.train_vlm_distill import (
+    RunningLossNormalizer,
+    cognition_distill_metrics,
+    resolve_action_distill_target,
+    save_student_checkpoint,
+    vitkd_distill_losses,
+)
 from vitra.models.vla.vitra_encoder_student import VITRA_EncoderStudent
 from vitra.models.vla.vitra_paligemma import VITRA_Paligemma
 from vitra.utils.config_utils import load_config
@@ -184,6 +191,14 @@ def test_running_loss_normalizer_initializes_and_clamps():
     assert torch.isfinite(tiny_norm)
 
 
+def test_action_distill_target_validation_accepts_teacher_and_gt():
+    assert resolve_action_distill_target({}) == "gt"
+    assert resolve_action_distill_target({"action_distill_target": "gt"}) == "gt"
+    assert resolve_action_distill_target({"action_distill_target": "teacher"}) == "teacher"
+    with pytest.raises(ValueError):
+        resolve_action_distill_target({"action_distill_target": "sampled_mse"})
+
+
 def test_encoder_student_cognition_shape_and_frozen_vision():
     model = make_dummy_encoder_student()
     batch = 2
@@ -203,6 +218,26 @@ def test_encoder_student_cognition_shape_and_frozen_vision():
     assert "text_encoder.proj.weight" in names
     assert "fusion.0.weight" in names
     assert "cognition_projection.weight" in names
+
+
+def test_encoder_student_train_returns_action_loss_dict():
+    model = make_dummy_encoder_student()
+    batch = 2
+    action_loss = model(
+        torch.zeros(batch, 3, 224, 224),
+        torch.ones(batch, 5, dtype=torch.long),
+        attention_mask=torch.ones(batch, 5, dtype=torch.bool),
+        action_labels=torch.zeros(batch, 2, 138),
+        action_masks=torch.ones(batch, 2, 138, dtype=torch.bool),
+        current_state=torch.zeros(batch, 212),
+        current_state_mask=torch.ones(batch, 212, dtype=torch.bool),
+        fov=torch.zeros(batch, 2),
+        mode="train",
+    )
+
+    assert isinstance(action_loss, dict)
+    assert "loss" in action_loss
+    assert action_loss["loss"].ndim == 0
 
 
 def test_vitkd_distill_losses_use_masked_features():
@@ -290,6 +325,20 @@ def test_encoder_student_config_uses_separate_teacher_and_student():
     assert config["student_vlm"]["text_encoder_name"] == "distilbert-base-uncased"
     assert config["student_vlm"]["student_output_size"] == 2304
     assert config["action_model"]["model_type"] == "DiT-S"
+
+
+def test_encoder_student_teacher_action_config_uses_normalized_teacher_target():
+    config = load_config("vitra/configs/vlm_distill_encoder_student_gigahands_teacher_action_normalized.json")
+
+    assert config["vla_name"] == "VITRA_EncoderStudent"
+    assert config["distill_loss_mode"] == "normalized"
+    assert config["action_distill_target"] == "teacher"
+    assert config["output_root"] == "/home/hannahyao24/scratch/hannahyao24/projects/VLA-HAND/VLM-DISTILL/models"
+    assert config["distill_train_setup"]["freeze_option"] == "encoder_student_action"
+    assert config["action_eval"]["checkpoint_config"].endswith(
+        "vlm_distill_encoder_student_gigahands_teacher_action_normalized.json"
+    )
+    assert config["action_eval"]["label"] == "encoder_student_teacher_action"
 
 
 def test_triad_summary_includes_required_action_feature_and_probe_keys():
