@@ -1177,6 +1177,10 @@ def select_eval_indices(dataset, args: argparse.Namespace) -> list[int]:
     core = dataset.episodic_dataset_core
     if args.eval_sample_strategy == "sequential":
         return list(range(min(args.num_eval_clips, len(dataset))))
+    if args.eval_sample_strategy == "random":
+        sample_count = min(args.num_eval_clips, len(dataset))
+        rng = np.random.default_rng(args.seed)
+        return [int(idx) for idx in rng.choice(len(dataset), size=sample_count, replace=False)]
 
     index_frame_pair = np.asarray(core.index_frame_pair)
     selected: list[int] = []
@@ -2074,7 +2078,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--eval_sample_strategy",
-        choices=["sequential", "first_per_episode", "middle_per_episode"],
+        choices=["sequential", "random", "first_per_episode", "middle_per_episode"],
         default="sequential",
     )
     parser.add_argument("--no_videos", action="store_true")
