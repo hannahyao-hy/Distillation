@@ -59,6 +59,7 @@ In the local workspace this may be a symlink to a Hugging Face cache path.
 | Encoder student | `vitra/configs/vlm_distill_encoder_student_gigahands.json` | DINOv2 vision encoder + DistilBERT text encoder + fusion projection | `weighted` cognition loss |
 | Encoder student action | `vitra/configs/vlm_distill_encoder_student_gigahands_action.json` | Encoder student initialized from cognition distill | `action_only` |
 | Encoder student joint | `vitra/configs/vlm_distill_encoder_student_gigahands_joint_normalized.json` | Encoder student initialized from cognition distill | `normalized` cognition + action |
+| Encoder student teacher-action normalized | `vitra/configs/vlm_distill_encoder_student_gigahands_teacher_action_normalized.json` | Encoder student initialized from the 10k cognition run, with the DiT action head trainable | normalized cognition + teacher-action distillation |
 | Small ViTKD full | `vitra/configs/vlm_distill_small_vitra_vitkd_full_gigahands.json` | Smaller PaliGemma-style student | `vitkd` |
 | Small ViTKD large run | `vitra/configs/vlm_distill_small_vitra_vitkd_full_gigahands_large.json` | Smaller PaliGemma-style student | `vitkd` |
 
@@ -123,6 +124,15 @@ torchrun --nproc_per_node=1 --standalone \
   --config vitra/configs/vlm_distill_small_vitra_vitkd_full_gigahands.json
 ```
 
+Run the current teacher-action-normalized encoder student:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 \
+torchrun --nproc_per_node=1 --standalone \
+  scripts/train_vlm_distill.py \
+  --config vitra/configs/vlm_distill_encoder_student_gigahands_teacher_action_normalized.json
+```
+
 Run the short ViTKD ablation suite:
 
 ```bash
@@ -151,6 +161,12 @@ RUN_DIR=runs/vlm_distill_gigahands_cognition/checkpoints/vlm_distill_gigahands_c
 bash scripts/evaluate_vlm_distill_cognition_sweep_gigahands.sh
 ```
 
+Latest teacher-action-normalized encoder-student results are summarized in:
+
+```text
+vlm_encoder_student_teacher_action_results.md
+```
+
 ## Important Config Fields
 
 - `teacher_config`: VITRA teacher architecture/config.
@@ -161,9 +177,11 @@ bash scripts/evaluate_vlm_distill_cognition_sweep_gigahands.sh
 - `action_loss_weight`: ground-truth action loss weight for joint training.
 - `max_saved_checkpoints`: how many checkpoint directories to keep.
 
-## Current Encoder-Student Run
+## Current Student Runs
 
-The 10k encoder-student run used:
+### Cognition-only encoder student
+
+The original 10k encoder-student run used:
 
 ```text
 vitra/configs/vlm_distill_encoder_student_gigahands.json
@@ -180,7 +198,39 @@ Main settings:
 - `save_steps`: `1000`.
 - Final local checkpoint: `epoch=0-step=10000.ckpt`.
 
-The checkpoint itself is not committed to this repository.
+This run aligns the compact encoder cognition feature with the teacher, but its final 100-random-clip action eval is poor because the action head was not trained with the student feature:
+
+| Checkpoint | action_mse | left_action_mse | right_action_mse | dual_hand_action_mse |
+| --- | ---: | ---: | ---: | ---: |
+| `epoch=0-step=10000.ckpt` | 51.858463 | 51.866955 | 51.838783 | 51.840664 |
+
+### Latest teacher-action-normalized encoder student
+
+The latest retained student run starts from the 10k cognition-only encoder checkpoint and trains the student text/fusion path plus DiT action head with normalized cognition and teacher-action losses:
+
+```text
+vitra/configs/vlm_distill_encoder_student_gigahands_teacher_action_normalized.json
+```
+
+Main settings:
+
+- Student init: `runs/vlm_distill_encoder_student_gigahands/checkpoints/vlm_distill_encoder_student_gigahands_TB2_B1_bf16True/checkpoints/epoch=0-step=10000.ckpt/weights.pt`.
+- Teacher: GigaHands BRICS camera 0 VITRA checkpoint at step 28000.
+- Loss: normalized cognition loss plus teacher-action distillation.
+- Trainable groups: action head, FOV encoder, DistilBERT text encoder, and fusion projection.
+- `max_steps`: `2000`.
+- `total_batch_size`: `2`.
+- `save_steps`: `500`.
+- Latest local checkpoint: `VLM-DISTILL/models/vlm_distill_encoder_student_gigahands_teacher_action_normalized_TB2_B1_bf16True/checkpoints/epoch=0-step=2000.ckpt`.
+
+20 sequential test clips were evaluated with 10 DDIM steps and CFG `5.0`. The latest checkpoint has `action_mse=0.446638`; the best retained eval is step 1500 with `action_mse=0.409036`.
+
+| Checkpoint | action_mse | left_action_mse | right_action_mse | dual_hand_action_mse | vlm_cognition_mse | vlm_cognition_cosine |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `epoch=0-step=1500.ckpt` | 0.409036 | 0.399437 | 0.430975 | 0.409036 | 0.00008157 | 0.996596 |
+| `epoch=0-step=2000.ckpt` | 0.446638 | 0.392757 | 0.569795 | 0.446638 | 0.00007798 | 0.996745 |
+
+Checkpoint weights are not committed to this repository.
 
 ## Notes
 

@@ -1,6 +1,6 @@
 # Student Checkpoint Index
 
-Checkpoint weights are not copied into `VLM-DISTILL/`. They stay in `runs/` because the files are too large for normal git storage.
+Checkpoint weights are local artifacts under `runs/` or `VLM-DISTILL/models/`. They are too large for normal git storage and are ignored by git.
 
 ## Encoder Student
 
@@ -49,7 +49,7 @@ Summary:
 - Objective: cognition-token MSE against the GigaHands VITRA teacher.
 - Trained to: `10000` steps.
 - Final logged loss: about `8e-05`.
-- Action eval available locally only for the untrained probe run, not the final 10k checkpoint.
+- Final 100-random-clip action eval: `action_mse=51.858463`; this is poor because the action head was not trained with the student feature.
 
 ## ViTKD-Style Small Student
 
@@ -109,6 +109,71 @@ Summary:
   - `vlm_cognition_mse`: about `6.1e-05`
   - `vlm_cognition_cosine`: about `0.997`
 - Action MSE remained poor in the 20-clip eval because the action head was not trainable in that run.
+
+## Teacher-Action-Normalized Encoder Student
+
+Config:
+
+```text
+vitra/configs/vlm_distill_encoder_student_gigahands_teacher_action_normalized.json
+```
+
+Copied config:
+
+```text
+VLM-DISTILL/configs/vlm_distill_encoder_student_gigahands_teacher_action_normalized.json
+```
+
+Latest checkpoint:
+
+```text
+VLM-DISTILL/models/vlm_distill_encoder_student_gigahands_teacher_action_normalized_TB2_B1_bf16True/checkpoints/epoch=0-step=2000.ckpt
+```
+
+Files:
+
+```text
+VLM-DISTILL/models/vlm_distill_encoder_student_gigahands_teacher_action_normalized_TB2_B1_bf16True/checkpoints/epoch=0-step=2000.ckpt/weights.pt
+VLM-DISTILL/models/vlm_distill_encoder_student_gigahands_teacher_action_normalized_TB2_B1_bf16True/checkpoints/epoch=0-step=2000.ckpt/meta.json
+```
+
+Local retained checkpoints:
+
+```text
+epoch=0-step=500.ckpt   weights.pt ~694 MB
+epoch=0-step=1000.ckpt  weights.pt ~694 MB
+epoch=0-step=1500.ckpt  weights.pt ~694 MB
+epoch=0-step=2000.ckpt  weights.pt ~694 MB
+```
+
+Training log:
+
+```text
+VLM-DISTILL/models/training_logs/vlm_distill_encoder_student_gigahands_teacher_action_normalized_20260428_000421.log
+```
+
+Final action eval:
+
+```text
+runs/vlm_distill_encoder_student_gigahands_teacher_action_normalized/action_eval/epoch=0-step=2000.ckpt/metrics.json
+```
+
+Best retained action eval:
+
+```text
+runs/vlm_distill_encoder_student_gigahands_teacher_action_normalized/action_eval/epoch=0-step=1500.ckpt/metrics.json
+```
+
+Summary:
+
+- Student: DINOv2-base + DistilBERT encoder student initialized from the 10k cognition-only run.
+- Objective: normalized cognition alignment plus teacher-action distillation.
+- Trained to: `2000` steps.
+- Best retained 20-clip action MSE: `0.409036` at step `1500`.
+- Latest 20-clip action MSE: `0.446638` at step `2000`.
+- Latest feature alignment to teacher:
+  - `vlm_cognition_mse`: `0.00007798`
+  - `vlm_cognition_cosine`: `0.996745`
 
 ## Teacher Checkpoint
 

@@ -14,6 +14,16 @@ The files here are copied from their original repo locations so the distillation
 - Training objective: cognition-token distillation from the GigaHands VITRA teacher.
 - Final local checkpoint: step 10000.
 
+### Teacher-action-normalized encoder student
+
+- Model file: `models/vitra_encoder_student.py`
+- Main config: `configs/vlm_distill_encoder_student_gigahands_teacher_action_normalized.json`
+- Student design: same encoder student, initialized from the step 10000 cognition-only checkpoint, with the DiT action head trainable.
+- Training objective: normalized cognition alignment plus teacher-action distillation.
+- Latest local checkpoint: step 2000.
+- Best retained 20-clip action eval: step 1500, `action_mse=0.409036`.
+- Latest 20-clip action eval: step 2000, `action_mse=0.446638`.
+
 ### ViTKD-style small student
 
 - Model file: `models/vitra_small_paligemma_student.py`
@@ -52,6 +62,15 @@ torchrun --nproc_per_node=1 --standalone \
   --config vitra/configs/vlm_distill_small_vitra_vitkd_full_gigahands.json
 ```
 
+Run the current teacher-action-normalized encoder student:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 \
+torchrun --nproc_per_node=1 --standalone \
+  scripts/train_vlm_distill.py \
+  --config vitra/configs/vlm_distill_encoder_student_gigahands_teacher_action_normalized.json
+```
+
 Evaluate a student checkpoint:
 
 ```bash
@@ -61,4 +80,6 @@ bash scripts/evaluate_vlm_distill_gigahands.sh \
 
 ## Important Note
 
-Checkpoint weights are not copied into this folder. They are multi-GB files under `runs/`, and `runs/` is ignored by git. See `docs/CHECKPOINTS.md` for exact local paths.
+Checkpoint weights are local artifacts under `runs/` or `VLM-DISTILL/models/` and are ignored by git. See `docs/CHECKPOINTS.md` for exact local paths.
+
+The latest teacher-action-normalized student metrics are summarized in the repo-root `vlm_encoder_student_teacher_action_results.md`.
