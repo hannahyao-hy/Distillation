@@ -280,6 +280,53 @@ def resolve_loss_mode(variant: dict[str, Any]) -> str:
     return mode
 
 
+def resolve_action_distill_target(variant: dict[str, Any]) -> str:
+    target = variant.get("action_distill_target", "gt")
+    valid_targets = {"gt", "teacher"}
+    if target not in valid_targets:
+        raise ValueError(
+            f"Unsupported action_distill_target={target!r}; supported targets: {sorted(valid_targets)}"
+        )
+    return target
+
+
+def extract_teacher_cognition_and_actions(
+    teacher,
+    teacher_inputs: dict[str, torch.Tensor],
+    action_masks: torch.Tensor,
+    variant: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    action_eval_config = variant.get("action_eval", {})
+    cfg_scale = variant.get("teacher_action_cfg_scale", action_eval_config.get("cfg_scale", 5.0))
+    use_ddim = variant.get("teacher_action_use_ddim", True)
+    num_ddim_steps = variant.get("teacher_action_num_ddim_steps", action_eval_config.get("num_ddim_steps", 10))
+
+    output_hs, inputs_masks = teacher.prepare_vlm_features(
+        pixel_values=teacher_inputs["pixel_values"],
+        input_ids=teacher_inputs["input_ids"],
+        attention_mask=teacher_inputs.get("attention_mask"),
+        current_state_mask=teacher_inputs.get("current_state_mask"),
+        current_state=teacher_inputs.get("current_state"),
+        fov=teacher_inputs.get("fov"),
+        use_cache=False,
+    )
+    teacher_cognition = teacher.extract_cognition_token(output_hs, inputs_masks).squeeze(1)
+    teacher_actions, _ = teacher._forward_act_model(
+        vlm_features=output_hs,
+        attention_mask=inputs_masks,
+        action_masks=action_masks,
+        current_state=teacher_inputs.get("current_state"),
+        current_state_mask=teacher_inputs.get("current_state_mask"),
+        mode="eval",
+        repeated_diffusion_steps=1,
+        cfg_scale=cfg_scale,
+        use_ddim=use_ddim,
+        num_ddim_steps=num_ddim_steps,
+    )
+    teacher_actions = teacher_actions * action_masks.to(dtype=teacher_actions.dtype, device=teacher_actions.device)
+    return teacher_cognition.detach(), teacher_actions.detach()
+
+
 def save_student_checkpoint(
     student,
     run_dir: Path,
@@ -580,12 +627,8 @@ def experiment(variant):
     max_steps = variant["trainer"]["max_steps"]
     cognition_loss_weight, action_loss_weight = resolve_loss_weights(variant)
     loss_mode = resolve_loss_mode(variant)
-    action_distill_target = variant.get("action_distill_target", "gt")
+    action_distill_target = resolve_action_distill_target(variant)
     action_loss_required = loss_mode in {"action_only", "normalized"} or action_loss_weight > 0.0
-    if action_loss_required and action_distill_target != "gt":
-        raise ValueError(
-            f"Unsupported action_distill_target={action_distill_target!r}; currently supported: 'gt'."
-        )
     normalizer_config = variant.get("loss_normalization", {})
     loss_normalizer = RunningLossNormalizer(
         decay=normalizer_config.get("ema_decay", 0.99),
@@ -617,6 +660,7 @@ def experiment(variant):
                 action_masks = batch.get("action_masks")
 
                 teacher_inputs = prepare_teacher_inputs(teacher, batch, device_id)
+                teacher_action_targets = None
                 if loss_mode == "vitkd":
                     shallow_layers = vitkd_config.get("shallow_layers", [0, 1])
                     deep_layer = vitkd_config.get("deep_layer", -1)
@@ -645,7 +689,17 @@ def experiment(variant):
                     vlm_cognition_mse = vitkd_losses.get("cognition")
                 else:
                     with torch.no_grad():
-                        teacher_cognition = teacher.extract_cognition_features(**teacher_inputs)
+                        if action_loss_required and action_distill_target == "teacher":
+                            if action_masks is None:
+                                raise KeyError("Teacher action distillation requested, but batch is missing 'action_masks'.")
+                            teacher_cognition, teacher_action_targets = extract_teacher_cognition_and_actions(
+                                teacher=teacher,
+                                teacher_inputs=teacher_inputs,
+                                action_masks=action_masks,
+                                variant=variant,
+                            )
+                        else:
+                            teacher_cognition = teacher.extract_cognition_features(**teacher_inputs)
                     student_cognition = student(
                         rgb,
                         input_ids,
@@ -663,13 +717,29 @@ def experiment(variant):
 
                 action_loss = None
                 if action_loss_required:
-                    if action_labels is None or action_masks is None:
-                        raise KeyError("Action loss requested, but batch is missing 'actions' or 'action_masks'.")
+                    if action_masks is None:
+                        raise KeyError("Action loss requested, but batch is missing 'action_masks'.")
+                    if action_distill_target == "gt":
+                        if action_labels is None:
+                            raise KeyError("GT action loss requested, but batch is missing 'actions'.")
+                        action_targets = action_labels
+                    else:
+                        action_targets = teacher_action_targets
+                        if action_targets is None:
+                            with torch.no_grad():
+                                _, action_targets = extract_teacher_cognition_and_actions(
+                                    teacher=teacher,
+                                    teacher_inputs=teacher_inputs,
+                                    action_masks=action_masks,
+                                    variant=variant,
+                                )
+                        loss_metrics["vlm_teacher_action_target_mean"] = action_targets.float().mean().detach()
+
                     action_prediction = student(
                         rgb,
                         input_ids,
                         attention_mask=attention_mask,
-                        action_labels=action_labels,
+                        action_labels=action_targets,
                         action_masks=action_masks,
                         current_state_mask=current_state_mask,
                         current_state=current_state,
@@ -678,7 +748,7 @@ def experiment(variant):
                     )
                     action_loss = action_prediction["loss"]
                     loss_metrics["action_loss"] = action_loss.detach()
-                    loss_metrics["vlm_action_loss_gt"] = action_loss.detach()
+                    loss_metrics[f"vlm_action_loss_{action_distill_target}"] = action_loss.detach()
 
                     for key, value in action_prediction.items():
                         if key == "loss":

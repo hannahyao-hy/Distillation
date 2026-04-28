@@ -292,6 +292,7 @@ class VITRA_EncoderStudent(nn.Module):
         )
         if mode == "vlm_cognition":
             return features
+        assert mode == "train", f"mode {mode} not supported in the forward function."
         _, action_loss = self._forward_act_model(
             features,
             action_labels=action_labels,
